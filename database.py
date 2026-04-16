@@ -4,7 +4,7 @@ import os
 from contextlib import contextmanager
 
 # Путь к базе данных (можно переопределить через переменную окружения)
-DB_FILE = os.getenv("DB_PATH", "vanguard.db")
+DB_FILE = os.getenv("DB_PATH", "antisocial.db")
 
 @contextmanager
 def get_db():
