@@ -1,4 +1,5 @@
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import json
 import os
@@ -6,6 +7,7 @@ import asyncio
 import datetime
 import aiohttp
 import re
+import subprocess
 from flask import Flask, render_template, jsonify, request, session, redirect, url_for
 from functools import wraps
 import threading
@@ -22,39 +24,99 @@ init_database()
 # --- НАСТРОЙКИ ---
 # ==========================================
 intents = discord.Intents.all()
-bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
+bot = commands.Bot(command_prefix="/", intents=intents, help_command=None)
+COMMANDS_SYNCED = False
 
-OWNER_ID = 1057383313708433438
-CO_OWNER_ID = 1119690054474944597
+OWNER_ID = 1501654483925602366
+TEXADMIN_ID = 1558756135182405650
+TRUSTED_USER_IDS = {OWNER_ID, TEXADMIN_ID}
 
-MAIN_SERVER_ID = 1494418308127133876
-AUTO_ROLE_ID = 1494418308127133877
+MAIN_SERVER_ID = 1574399255605547049
+AUTO_ROLE_ID = 1574399255605547053
+BLACKLIST_ROLE_ID = 1510053933358514176
 
 UI_COLOR = 0x2b2d31
 RED_COLOR = 0xdd2e44
 
+def is_trusted_user(user_id):
+    return int(user_id) in TRUSTED_USER_IDS
+
 # ==========================================
 # --- ДИЗАЙН ---
 # ==========================================
-async def reply_ok(ctx, text):
-    await ctx.send(f"> ( + ) {text}")
+def supports_ephemeral(ctx):
+    return getattr(ctx, "interaction", None) is not None
 
-async def reply_err(ctx, text):
-    await ctx.send(f"> ( - ) {text}")
+async def send_ctx(ctx, content=None, *, embed=None, ephemeral=False):
+    if supports_ephemeral(ctx):
+        return await ctx.send(content, embed=embed, ephemeral=ephemeral)
+    return await ctx.send(content, embed=embed)
 
-async def reply_info(ctx, text):
-    return await ctx.send(f"> ( ⏳ ) {text}")
+async def reply_ok(ctx, text, *, ephemeral=True):
+    return await send_ctx(ctx, f"> ( + ) {text}", ephemeral=ephemeral)
+
+async def reply_err(ctx, text, *, ephemeral=True):
+    return await send_ctx(ctx, f"> ( - ) {text}", ephemeral=ephemeral)
+
+async def reply_info(ctx, text, *, ephemeral=True):
+    return await send_ctx(ctx, f"> ( ⏳ ) {text}", ephemeral=ephemeral)
 
 @bot.check
 async def require_main_server(ctx):
-    # Владельцы могут использовать команды везде
-    if ctx.author.id in [OWNER_ID, CO_OWNER_ID]:
-        return True
-    # Если MAIN_SERVER_ID не установлен, команды доступны везде
-    if MAIN_SERVER_ID == 0:
-        return True
-    # Все остальные тоже могут использовать команды
     return True
+
+@bot.event
+async def on_command_error(ctx, error):
+    error = getattr(error, "original", error)
+
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    if isinstance(error, commands.CheckFailure):
+        return await reply_err(ctx, "Проверка доступа к команде не пройдена.")
+
+    if isinstance(error, (commands.BadArgument, commands.MissingRequiredArgument)):
+        return await reply_err(ctx, "Неверные аргументы команды. Проверьте подсказки Discord или `/help`.")
+
+    try:
+        await reply_err(ctx, f"Ошибка выполнения команды: {error}")
+    except Exception:
+        pass
+    print(f"Command error in {getattr(ctx.command, 'qualified_name', 'unknown')}: {error}")
+
+async def send_interaction_error(interaction, text):
+    content = f"> ( - ) {text}"
+    if interaction.response.is_done():
+        await interaction.followup.send(content, ephemeral=True)
+    else:
+        await interaction.response.send_message(content, ephemeral=True)
+
+@bot.tree.error
+async def on_app_command_error(interaction, error):
+    error = getattr(error, "original", error)
+    if isinstance(error, app_commands.CheckFailure):
+        return await send_interaction_error(interaction, "Недостаточно прав для этой команды.")
+    await send_interaction_error(interaction, f"Ошибка выполнения команды: {error}")
+    print(f"App command error in {getattr(interaction.command, 'name', 'unknown')}: {error}")
+
+async def sync_application_commands():
+    global_commands = list(bot.tree.get_commands())
+    bot.tree.clear_commands(guild=None)
+    await bot.tree.sync()
+
+    for command in global_commands:
+        bot.tree.add_command(command, override=True)
+
+    synced_guilds = 0
+
+    for guild in bot.guilds:
+        guild_obj = discord.Object(id=guild.id)
+        bot.tree.clear_commands(guild=guild_obj)
+        bot.tree.copy_global_to(guild=guild_obj)
+        synced_guilds += len(await bot.tree.sync(guild=guild_obj))
+        await asyncio.sleep(0.2)
+
+    return len(global_commands), synced_guilds
 
 # ==========================================
 # --- БАЗЫ ДАННЫХ (SQLite через обертки) ---
@@ -97,7 +159,7 @@ class DBDictOfLists:
         return True
 
 class DBDictOfDicts:
-    """Словарь словарей для access/stable_roles/bans"""
+    """Словарь словарей для access/bans"""
     def __init__(self, get_func, set_func, del_func):
         self.get_func = get_func
         self.set_func = set_func
@@ -175,12 +237,6 @@ PROTECTED_USERS = DBDictOfLists(
     remove_from_protected
 )
 
-STABLE_ROLES = DBDictOfDicts(
-    get_stable_roles,
-    set_stable_role,
-    remove_stable_role
-)
-
 TEMP_BANS = DBDictOfDicts(
     get_temp_bans,
     add_temp_ban,
@@ -208,8 +264,9 @@ class AutoRolesDict:
         return get_auto_role(str(guild_id))
     def __setitem__(self, guild_id, value):
         enabled = value.get('enabled', False)
+        role_ids = value.get('role_ids')
         role_id = value.get('role_id')
-        set_auto_role(str(guild_id), enabled, role_id)
+        set_auto_role(str(guild_id), enabled, role_id, role_ids)
 
 AUTO_ROLES = AutoRolesDict()
 
@@ -243,32 +300,181 @@ def save_backup(file, data):
 # ==========================================
 # --- АНТИРЕЙД ЗАЩИТА ---
 # ==========================================
-BAN_TRACKER = {}  # {guild_id: {user_id: [timestamps]}}
+CREATE_VIOLATION_TRACKER = {}  # {guild_id: {user_id: [timestamps]}}
+MOD_ACTION_TRACKER = {}  # {guild_id: {user_id: [timestamps]}}
 
-def track_ban(guild_id, user_id):
-    """Отслеживает баны и возвращает True если превышен лимит"""
+def track_recent_action(tracker, guild_id, user_id, window_seconds):
     now = datetime.datetime.now()
     gid = str(guild_id)
     uid = str(user_id)
-    
-    if gid not in BAN_TRACKER:
-        BAN_TRACKER[gid] = {}
-    if uid not in BAN_TRACKER[gid]:
-        BAN_TRACKER[gid][uid] = []
-    
-    # Удаляем старые баны (старше 1 минуты)
-    BAN_TRACKER[gid][uid] = [t for t in BAN_TRACKER[gid][uid] if (now - t).seconds < 60]
-    
-    # Добавляем текущий бан
-    BAN_TRACKER[gid][uid].append(now)
-    
-    # Проверяем лимит (5 банов за минуту)
-    return len(BAN_TRACKER[gid][uid]) >= 5
+
+    if gid not in tracker:
+        tracker[gid] = {}
+    if uid not in tracker[gid]:
+        tracker[gid][uid] = []
+
+    tracker[gid][uid] = [
+        t for t in tracker[gid][uid]
+        if (now - t).total_seconds() < window_seconds
+    ]
+    tracker[gid][uid].append(now)
+    return len(tracker[gid][uid])
+
+def clear_recent_actions(tracker, guild_id, user_id):
+    gid = str(guild_id)
+    uid = str(user_id)
+    if gid in tracker and uid in tracker[gid]:
+        tracker[gid][uid] = []
+
+def track_creation_violation(guild_id, user_id):
+    return track_recent_action(CREATE_VIOLATION_TRACKER, guild_id, user_id, 120)
+
+def track_moderation_action(guild_id, user_id):
+    return track_recent_action(MOD_ACTION_TRACKER, guild_id, user_id, 60)
+
+def add_apusy_record(guild_id, user_id, days=999):
+    end = datetime.datetime.now() + datetime.timedelta(days=days)
+    end_str = end.strftime("%d.%m.%Y %H:%M:%S")
+    g_abans = get_g_dict(A_TEMP_BANS, guild_id)
+    g_abans[str(user_id)] = end_str
+    return end_str
+
+async def send_dm_warning(user, message):
+    try:
+        await user.send(message)
+        return True
+    except:
+        return False
+
+async def issue_apusy_ban(guild, user, reason, *, log_title=None, log_description=None, remove_from_whitelist=False):
+    if remove_from_whitelist:
+        wl = get_g_list(WHITELIST_IDS, guild.id)
+        if user.id in wl:
+            wl.remove(user.id)
+
+    add_apusy_record(guild.id, user.id)
+
+    ban_applied = False
+    try:
+        await guild.ban(discord.Object(id=user.id), reason=reason)
+        ban_applied = True
+    except:
+        pass
+
+    if log_title and log_description:
+        await send_log(guild, log_title, log_description, RED_COLOR)
+
+    return ban_applied
+
+async def handle_unauthorized_creation(guild, actor, action_text, cleanup_coro):
+    violation_count = track_creation_violation(guild.id, actor.id)
+
+    cleanup_ok = True
+    try:
+        await cleanup_coro
+    except:
+        cleanup_ok = False
+
+    if violation_count >= 3:
+        ban_applied = False
+        try:
+            await guild.ban(actor, reason="Anti-Nuke: многократное создание каналов/ролей без WhiteList")
+            ban_applied = True
+        except:
+            pass
+
+        if ban_applied:
+            clear_recent_actions(CREATE_VIOLATION_TRACKER, guild.id, actor.id)
+
+        cleanup_note = "Объект удален." if cleanup_ok else "Объект не удалось удалить автоматически."
+        ban_note = "Нарушитель забанен." if ban_applied else "Бот не смог выдать бан автоматически."
+        await send_log(
+            guild,
+            "Anti-Nuke (Создание)",
+            f"{actor.mention} {action_text} без WhiteList 3 раза за 2 минуты.\n{cleanup_note}\n{ban_note}",
+            RED_COLOR
+        )
+        return
+
+    dm_sent = await send_dm_warning(
+        actor,
+        f"Предупреждение Anti-Nuke на сервере {guild.name}: у вас нет WhiteList для создания каналов и ролей. "
+        f"Зафиксировано {violation_count}/3 нарушений за 2 минуты. При третьем нарушении вы будете забанены."
+    )
+    cleanup_note = "Объект удален." if cleanup_ok else "Объект не удалось удалить автоматически."
+    dm_note = "Предупреждение отправлено в ЛС." if dm_sent else "Не удалось отправить предупреждение в ЛС."
+    await send_log(
+        guild,
+        "Anti-Nuke (Предупреждение)",
+        f"{actor.mention} {action_text} без WhiteList.\n{cleanup_note}\nПредупреждение {violation_count}/3. {dm_note}",
+        UI_COLOR
+    )
+
+def detect_log_category(title, description=""):
+    text = f"{title} {description}".lower()
+
+    if any(keyword in text for keyword in ["anti-nuke", "anti-raid", "вебхук", "боты", "предупреждение"]):
+        return "security"
+    if any(keyword in text for keyword in ["апусы", "apusy", "pusy", "бан", "разбан", "kick", "кик", "очистка"]):
+        return "moderation"
+    if any(keyword in text for keyword in ["вайтлист", "whitelist", "mod", "доступ"]):
+        return "access"
+    if "blacklist" in text or "черный список" in text:
+        return "blacklist"
+    if any(keyword in text for keyword in ["прота", "protected", "защита"]):
+        return "protection"
+    if any(keyword in text for keyword in ["автороль", "role", "роль", "giverole", "giveall", "unrole"]):
+        return "roles"
+    if any(keyword in text for keyword in ["backup", "бэкап", "save_server", "load_server"]):
+        return "backup"
+    return "system"
+
+def detect_log_level(title, description="", color=UI_COLOR):
+    text = f"{title} {description}".lower()
+
+    if "предупреждение" in text:
+        return "warning"
+    if color == RED_COLOR or any(keyword in text for keyword in ["anti-nuke", "anti-raid", "apusy", "бан", "blacklist"]):
+        return "danger"
+    if any(keyword in text for keyword in ["разбан", "снят", "снял", "удален из", "обновлены"]):
+        return "success"
+    return "info"
+
+def save_panel_log_entry(guild_id, title, description, *, color=UI_COLOR, source="bot"):
+    created_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        add_panel_log(
+            guild_id,
+            title,
+            description,
+            created_at,
+            level=detect_log_level(title, description, color),
+            category=detect_log_category(title, description),
+            source=source
+        )
+    except Exception:
+        pass
+
+def save_web_log(guild_id, title, description, *, level="info", category="panel"):
+    created_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        add_panel_log(
+            guild_id,
+            title,
+            description,
+            created_at,
+            level=level,
+            category=category,
+            source="panel"
+        )
+    except Exception:
+        pass
 
 # ==========================================
 # --- ФУНКЦИЯ ЛОГИРОВАНИЯ ---
 # ==========================================
 async def send_log(guild, title, description, color=UI_COLOR):
+    save_panel_log_entry(guild.id, title, description, color=color, source="discord")
     gid = str(guild.id)
     if gid in LOG_CHANNELS:
         ch_id = LOG_CHANNELS[gid]
@@ -346,11 +552,127 @@ if MAIN_SERVER_ID != 0:
             WHITELIST_IDS[main_gid].append(uid)
 
 def get_lvl(guild_id, uid):
-    if int(uid) in [OWNER_ID, CO_OWNER_ID]: return 3
+    if is_trusted_user(uid): return 3
     if not guild_id: return 0
     guild_access = get_g_dict(USER_ACCESS, guild_id)
     lvl_name = guild_access.get(str(uid), "none")
     return {"low": 1, "mid": 2, "pusy": 3}.get(lvl_name, 0)
+
+def get_bot_member(guild):
+    return guild.me or guild.get_member(bot.user.id)
+
+def parse_user_id(value):
+    if value is None:
+        return None
+    if isinstance(value, (discord.User, discord.Member)):
+        return value.id
+
+    match = re.search(r"\d{15,25}", str(value))
+    if not match:
+        return None
+
+    try:
+        return int(match.group(0))
+    except ValueError:
+        return None
+
+async def resolve_user(ctx, value):
+    user_id = parse_user_id(value)
+    if not user_id:
+        return None, None
+
+    member = ctx.guild.get_member(user_id) if ctx.guild else None
+    if member:
+        return user_id, member
+
+    user = bot.get_user(user_id)
+    if user:
+        return user_id, user
+
+    try:
+        return user_id, await bot.fetch_user(user_id)
+    except Exception:
+        return user_id, None
+
+def resolve_member(ctx, value):
+    user_id = parse_user_id(value)
+    if not user_id or not ctx.guild:
+        return None, None
+    return user_id, ctx.guild.get_member(user_id)
+
+def get_blacklist_manageable_roles(member):
+    bot_member = get_bot_member(member.guild)
+    if not bot_member:
+        return []
+    return [
+        role for role in member.roles
+        if not role.is_default()
+        and not role.managed
+        and role.id != BLACKLIST_ROLE_ID
+        and role < bot_member.top_role
+    ]
+
+async def apply_blacklist_restrictions(guild, user_id, reason="BlackList"):
+    member = guild.get_member(int(user_id))
+    if not member:
+        return False, "пользователь не найден на сервере"
+
+    warnings = []
+    roles_to_remove = get_blacklist_manageable_roles(member)
+    if not has_blacklist_role_snapshot(guild.id, member.id):
+        set_blacklist_role_snapshot(guild.id, member.id, [role.id for role in roles_to_remove])
+
+    if roles_to_remove:
+        try:
+            await member.remove_roles(*roles_to_remove, reason=reason)
+        except Exception as e:
+            warnings.append(f"не удалось снять роли: {e}")
+
+    bot_member = get_bot_member(guild)
+    blacklist_role = guild.get_role(BLACKLIST_ROLE_ID)
+    if not blacklist_role:
+        return True, "роль BlackList не найдена"
+    if bot_member and blacklist_role >= bot_member.top_role:
+        return True, "роль BlackList выше роли бота"
+    if blacklist_role not in member.roles:
+        try:
+            await member.add_roles(blacklist_role, reason=reason)
+        except Exception as e:
+            warnings.append(f"не удалось выдать роль BlackList: {e}")
+
+    return True, "; ".join(warnings) if warnings else None
+
+async def restore_blacklist_roles(guild, user_id, reason="BlackList снят"):
+    member = guild.get_member(int(user_id))
+    snapshot = get_blacklist_role_snapshot(guild.id, user_id)
+
+    if not member:
+        remove_blacklist_role_snapshot(guild.id, user_id)
+        return False, "пользователь не найден на сервере"
+
+    bot_member = get_bot_member(guild)
+    blacklist_role = guild.get_role(BLACKLIST_ROLE_ID)
+    warnings = []
+    if blacklist_role and blacklist_role in member.roles and bot_member and blacklist_role < bot_member.top_role:
+        try:
+            await member.remove_roles(blacklist_role, reason=reason)
+        except Exception as e:
+            warnings.append(f"не удалось снять роль BlackList: {e}")
+
+    roles_to_restore = []
+    for role_id in snapshot:
+        role = guild.get_role(int(role_id))
+        if role and role not in member.roles and not role.managed and bot_member and role < bot_member.top_role:
+            roles_to_restore.append(role)
+
+    if roles_to_restore:
+        try:
+            await member.add_roles(*roles_to_restore, reason=reason)
+        except Exception as e:
+            warnings.append(f"не удалось вернуть роли: {e}")
+
+    remove_blacklist_role_snapshot(guild.id, user_id)
+    return True, "; ".join(warnings) if warnings else None
 
 # ==========================================
 # --- БЫСТРЫЙ ANTI-NUKE ---
@@ -359,7 +681,7 @@ nuke_tracker = {}
 
 async def check_nuke_threat(guild, user, action_name):
     wl = get_g_list(WHITELIST_IDS, guild.id)
-    if user.id == bot.user.id or user.id in [OWNER_ID, CO_OWNER_ID] or user.id in wl:
+    if user.id == bot.user.id or is_trusted_user(user.id) or user.id in wl:
         return False
     now = datetime.datetime.now()
     if user.id not in nuke_tracker: 
@@ -395,33 +717,34 @@ async def on_member_ban(guild, user):
     if actor:
         wl = get_g_list(WHITELIST_IDS, guild.id)
         
-        # Проверка антирейда для вайтлиста (кроме владельцев)
-        if actor.id in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
-            if track_ban(guild.id, actor.id):
-                # Превышен лимит - снимаем вайтлист и баним
-                wl.remove(actor.id)
-                
-                # Добавляем в apusy бан
-                end = datetime.datetime.now() + datetime.timedelta(days=999)
-                end_str = end.strftime("%d.%m.%Y %H:%M:%S")
-                g_abans = get_g_dict(A_TEMP_BANS, guild.id)
-                g_abans[str(actor.id)] = end_str
-                
-                try:
-                    await guild.ban(actor, reason="Anti-Raid: массовые баны (5+ за минуту)")
-                    await send_log(guild, "Anti-Raid (Массовые баны)", 
-                                 f"{actor.mention} забанил 5+ человек за минуту.\nВайтлист снят, выдан APusy бан.", RED_COLOR)
-                except:
-                    pass
-                return
+        if actor.id in wl and not is_trusted_user(actor.id):
+            action_count = track_moderation_action(guild.id, actor.id)
+            if action_count > 3:
+                ban_applied = await issue_apusy_ban(
+                    guild,
+                    actor,
+                    "Anti-Raid: 4+ банов/киков за минуту при наличии WhiteList",
+                    log_title="Anti-Raid (Массовые баны/кики)",
+                    log_description=f"{actor.mention} забанил или кикнул более 3 человек за минуту.\nWhiteList снят, выдан APusy бан.",
+                    remove_from_whitelist=True
+                )
+                if ban_applied:
+                    clear_recent_actions(MOD_ACTION_TRACKER, guild.id, actor.id)
+            return
         
-        if actor.id != bot.user.id and actor.id not in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
+        if actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
             try:
-                await guild.ban(actor, reason="Anti-Nuke: бан без вайтлиста")
                 await guild.unban(user, reason="Anti-Nuke: отмена бана")
-                await send_log(guild, "Anti-Nuke (Ban)", f"{actor.mention} забанил {user.mention} без прав. \nНарушитель забанен, жертва разбанена.", RED_COLOR)
-            except: 
+            except:
                 pass
+
+            await issue_apusy_ban(
+                guild,
+                actor,
+                "Anti-Nuke: бан через Discord без WhiteList",
+                log_title="Anti-Nuke (Ban)",
+                log_description=f"{actor.mention} забанил {user.mention} без WhiteList.\nЖертва разбанена, нарушителю выдан APusy бан."
+            )
 
 @bot.event
 async def on_member_remove(member):
@@ -429,7 +752,22 @@ async def on_member_remove(member):
     actor = await get_audit_actor(guild, discord.AuditLogAction.kick, member.id)
     if actor:
         wl = get_g_list(WHITELIST_IDS, guild.id)
-        if actor.id != bot.user.id and actor.id not in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
+        if actor.id in wl and not is_trusted_user(actor.id):
+            action_count = track_moderation_action(guild.id, actor.id)
+            if action_count > 3:
+                ban_applied = await issue_apusy_ban(
+                    guild,
+                    actor,
+                    "Anti-Raid: 4+ банов/киков за минуту при наличии WhiteList",
+                    log_title="Anti-Raid (Массовые баны/кики)",
+                    log_description=f"{actor.mention} забанил или кикнул более 3 человек за минуту.\nWhiteList снят, выдан APusy бан.",
+                    remove_from_whitelist=True
+                )
+                if ban_applied:
+                    clear_recent_actions(MOD_ACTION_TRACKER, guild.id, actor.id)
+            return
+
+        if actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
             try:
                 await guild.ban(actor, reason="Anti-Nuke: кик без вайтлиста")
                 await send_log(guild, "Anti-Nuke (Kick)", f"{actor.mention} кикнул {member.mention} без прав. \nНарушитель забанен.", RED_COLOR)
@@ -442,7 +780,7 @@ async def on_guild_channel_delete(channel):
         guild = channel.guild
         actor = await get_audit_actor(guild, discord.AuditLogAction.channel_delete, channel.id)
         wl = get_g_list(WHITELIST_IDS, guild.id)
-        if actor and actor.id != bot.user.id and actor.id not in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
+        if actor and actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
             is_nuker = await check_nuke_threat(guild, actor, "Удаление каналов")
             try:
                 await channel.clone(reason="Anti-Nuke: восстановление канала")
@@ -459,15 +797,28 @@ async def on_guild_channel_create(channel):
         guild = channel.guild
         actor = await get_audit_actor(guild, discord.AuditLogAction.channel_create, channel.id)
         wl = get_g_list(WHITELIST_IDS, guild.id)
-        if actor and actor.id != bot.user.id and actor.id not in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
-            is_nuker = await check_nuke_threat(guild, actor, "Спам каналами")
-            try:
-                await channel.delete(reason="Anti-Nuke: удаление спам-канала")
-                if not is_nuker:
-                    await guild.ban(actor, reason="Anti-Nuke: создание каналов")
-                    await send_log(guild, "Anti-Nuke (Каналы)", f"{actor.mention} создал канал #{channel.name} без прав. \nКанал удален, нарушитель забанен.", RED_COLOR)
-            except: 
-                pass
+        if actor and actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
+            await handle_unauthorized_creation(
+                guild,
+                actor,
+                f"создал канал #{channel.name}",
+                channel.delete(reason="Anti-Nuke: удаление канала без WhiteList")
+            )
+    asyncio.create_task(process())
+
+@bot.event
+async def on_guild_role_create(role):
+    async def process():
+        guild = role.guild
+        actor = await get_audit_actor(guild, discord.AuditLogAction.role_create, role.id)
+        wl = get_g_list(WHITELIST_IDS, guild.id)
+        if actor and actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
+            await handle_unauthorized_creation(
+                guild,
+                actor,
+                f"создал роль @{role.name}",
+                role.delete(reason="Anti-Nuke: удаление роли без WhiteList")
+            )
     asyncio.create_task(process())
 
 @bot.event
@@ -476,7 +827,7 @@ async def on_guild_role_delete(role):
         guild = role.guild
         actor = await get_audit_actor(guild, discord.AuditLogAction.role_delete, role.id)
         wl = get_g_list(WHITELIST_IDS, guild.id)
-        if actor and actor.id != bot.user.id and actor.id not in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
+        if actor and actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
             is_nuker = await check_nuke_threat(guild, actor, "Удаление ролей")
             try:
                 await guild.create_role(name=role.name, permissions=role.permissions, color=role.color, hoist=role.hoist, mentionable=role.mentionable, reason="Anti-Nuke: восстановление роли")
@@ -493,7 +844,7 @@ async def on_webhooks_update(channel):
         guild = channel.guild
         wl = get_g_list(WHITELIST_IDS, guild.id)
         actor = await get_audit_actor(guild, discord.AuditLogAction.webhook_create, channel.id)
-        if actor and actor.id != bot.user.id and actor.id not in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
+        if actor and actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
             await check_nuke_threat(guild, actor, "Создание вебхуков")
             try:
                 await guild.ban(actor, reason="Anti-Nuke: вебхуки")
@@ -508,15 +859,17 @@ async def on_webhooks_update(channel):
 @bot.event
 async def on_member_join(member):
     if member.bot:
+        actor = await get_audit_actor(member.guild, discord.AuditLogAction.bot_add, member.id)
+        if actor and (actor.id == bot.user.id or is_trusted_user(actor.id)):
+            return
+
         try: 
             await member.ban(reason="Anti-Nuke: краш-бот")
         except: 
             pass
-        
-        actor = await get_audit_actor(member.guild, discord.AuditLogAction.bot_add, member.id)
         wl = get_g_list(WHITELIST_IDS, member.guild.id)
         
-        if actor and actor.id != bot.user.id and actor.id not in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
+        if actor and actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
             try: 
                 await member.guild.ban(actor, reason="Anti-Nuke: боты")
                 await send_log(member.guild, "Anti-Nuke (Боты)", f"{actor.mention} добавил бота {member.mention}. \nБот и нарушитель забанены.", RED_COLOR)
@@ -524,26 +877,26 @@ async def on_member_join(member):
                 pass
         return
 
+    if member.id in get_g_list(BLACKLIST_IDS, member.guild.id):
+        await apply_blacklist_restrictions(member.guild, member.id, reason="BlackList: вход пользователя")
+        return
+
     # Автороль для новых участников
     auto_roles = get_g_dict(AUTO_ROLES, member.guild.id)
-    if auto_roles.get('enabled') and auto_roles.get('role_id'):
-        role = member.guild.get_role(int(auto_roles['role_id']))
-        if role and role < member.guild.me.top_role:
+    role_ids = auto_roles.get('role_ids', [])
+    if auto_roles.get('enabled') and role_ids:
+        roles_to_add = []
+        for role_id in role_ids:
+            role = member.guild.get_role(int(role_id))
+            if role and role < member.guild.me.top_role:
+                roles_to_add.append(role)
+        if roles_to_add:
             try:
-                await member.add_roles(role, reason="Автороль при входе")
-                await send_log(member.guild, "Автороль", f"Выдана роль {role.mention} участнику {member.mention}", UI_COLOR)
+                await member.add_roles(*roles_to_add, reason="Автороль при входе")
+                mentions = ", ".join(role.mention for role in roles_to_add)
+                await send_log(member.guild, "Автороль", f"Выданы роли {mentions} участнику {member.mention}", UI_COLOR)
             except Exception as e:
                 print(f"Ошибка выдачи автороли: {e}")
-
-    s_roles = get_g_dict(STABLE_ROLES, member.guild.id)
-    if str(member.id) in s_roles:
-        role = member.guild.get_role(s_roles[str(member.id)])
-        if role and role < member.guild.me.top_role:
-            try: 
-                await member.edit(roles=[role], reason="Sbrole: фиксация при входе")
-                return 
-            except: 
-                pass
 
     if AUTO_ROLE_ID != 0:
         role = member.guild.get_role(AUTO_ROLE_ID)
@@ -555,7 +908,7 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_unban(guild, user):
-    if user.id in [OWNER_ID, CO_OWNER_ID]: return
+    if is_trusted_user(user.id): return
     
     g_bans = get_g_dict(TEMP_BANS, guild.id)
     a_bans = get_g_dict(A_TEMP_BANS, guild.id) 
@@ -596,14 +949,23 @@ async def on_message(message):
 # ==========================================
 # СИСТЕМА РОЛЕЙ И ПРОТА 
 # ==========================================
-async def check_anti_role(guild, member, added_roles):
+async def check_anti_role(guild, member, added_roles, baseline_role_ids):
     wl = get_g_list(WHITELIST_IDS, guild.id)
     actor = await get_audit_actor(guild, discord.AuditLogAction.member_role_update, member.id)
-    if actor and actor.id != bot.user.id and actor.id not in wl and actor.id not in [OWNER_ID, CO_OWNER_ID]:
-        try: 
-            await member.remove_roles(*added_roles, reason="Anti-Role: выдача без прав")
-        except: 
-            pass
+    if actor and actor.id != bot.user.id and actor.id not in wl and not is_trusted_user(actor.id):
+        for attempt in range(4):
+            current_member = guild.get_member(member.id)
+            if current_member:
+                roles_to_remove = [
+                    role for role in current_member.roles
+                    if role.id not in baseline_role_ids and role < guild.me.top_role and not role.is_default()
+                ]
+                if roles_to_remove:
+                    try:
+                        await current_member.remove_roles(*roles_to_remove, reason="Anti-Role: выдача без прав")
+                    except:
+                        pass
+            await asyncio.sleep(0.35)
 
 @bot.event
 async def on_member_update(before, after):
@@ -619,24 +981,9 @@ async def on_member_update(before, after):
             except: 
                 pass
 
-    uid_s = str(after.id)
-    s_roles = get_g_dict(STABLE_ROLES, guild.id)
-    if uid_s in s_roles:
-        role_id = s_roles[uid_s]
-        current_role_ids = [r.id for r in after.roles]
-        expected_role_ids = [guild.id, role_id]
-
-        if set(current_role_ids) != set(expected_role_ids):
-            role = guild.get_role(role_id)
-            if role and role < guild.me.top_role:
-                try: 
-                    await after.edit(roles=[role], reason="Sbrole: фиксация")
-                except: 
-                    pass
-
     added_roles = [r for r in after.roles if r not in before.roles]
     if added_roles:
-        asyncio.create_task(check_anti_role(guild, after, added_roles))
+        asyncio.create_task(check_anti_role(guild, after, added_roles, {role.id for role in before.roles}))
 
 @tasks.loop(seconds=10)
 async def check_unbans():
@@ -697,35 +1044,42 @@ async def check_unbans():
 # ==========================================
 # --- КОМАНДЫ ---
 # ==========================================
-@bot.command(name="setlog")
+@bot.hybrid_command(name="setlog", description="Установить канал для логов защиты")
+@app_commands.rename(channel="канал")
+@app_commands.describe(channel="Канал, куда бот будет отправлять логи")
 async def setlog_cmd(ctx, channel: discord.TextChannel = None):
-    if ctx.author.id not in [OWNER_ID, CO_OWNER_ID]: return
+    if not is_trusted_user(ctx.author.id):
+        return await reply_err(ctx, "Команда доступна только доверенным пользователям.")
     if not channel: return await reply_err(ctx, "Укажите канал")
 
     LOG_CHANNELS[str(ctx.guild.id)] = channel.id
     await reply_ok(ctx, f"Канал логов установлен на {channel.mention}")
 
-@bot.command(name="help")
+@bot.hybrid_command(name="help", description="Показать доступные вам команды")
 async def help_cmd(ctx):
-    lvl = get_lvl(ctx.guild.id, ctx.author.id)
+    guild_id = ctx.guild.id if ctx.guild else None
+    lvl = get_lvl(guild_id, ctx.author.id)
+    is_trusted = is_trusted_user(ctx.author.id)
 
     emb = discord.Embed(title="Справочник команд", color=RED_COLOR)
+    emb.set_footer(text=f"Ваш уровень: {'owner' if is_trusted else lvl}")
     emb.add_field(name="[ user ]", value="```\nhelp\nlist\n```", inline=False)
 
-    if lvl >= 1:
+    if lvl >= 1 or is_trusted:
         emb.add_field(name="[ low ]", value="```\nblacklist\nunblacklist\n```", inline=False)
-    if lvl >= 2:
-        emb.add_field(name="[ mid ]", value="```\nclear\npusy\nunpusy\nsbrole\nunsbrole\nunrole\nпрота\nанпрота\n```", inline=False)
-    if lvl >= 3:
-        lvl3_cmds = "mod\nunmod\nwl_add\nwl_remove\ngiverole\ngiveall\n"
-        if ctx.author.id in [OWNER_ID, CO_OWNER_ID]:
-            lvl3_cmds += "save_server\nload_server\n"
-        emb.add_field(name="[ pusy ]", value=f"```\n{lvl3_cmds}```", inline=False)
+    if lvl >= 2 or is_trusted:
+        emb.add_field(name="[ mid ]", value="```\nclear\npusy\nunpusy\nunrole\nпрота\nанпрота\n```", inline=False)
+    if lvl >= 3 or is_trusted:
+        emb.add_field(name="[ pusy ]", value="```\nmod\nunmod\nwl_add\nwl_remove\ngiverole\ngiveall\n```", inline=False)
+    if is_trusted:
+        emb.add_field(name="[ owner ]", value="```\nsetlog\napusy\naunpusy\nsay\nsave_server\nlist_backups\nload_server\n```", inline=False)
 
-    await ctx.send(embed=emb)
+    await send_ctx(ctx, embed=emb, ephemeral=True)
 
-@bot.command(name="list")
+@bot.hybrid_command(name="list", description="Показать списки доступов, WL, защиты, BL и банов")
 async def list_cmd(ctx):
+    if not ctx.guild:
+        return await reply_err(ctx, "Эта команда доступна только на сервере.")
     emb = discord.Embed(title=f"{ctx.guild.name}", color=RED_COLOR)
 
     def safe_fmt(lst):
@@ -739,9 +1093,9 @@ async def list_cmd(ctx):
     weights = {"pusy": 3, "mid": 2, "low": 1}
     g_access = get_g_dict(USER_ACCESS, ctx.guild.id).copy()
 
-    # Добавляем owner и co_owner как pusy
+    # Добавляем доверенных пользователей как pusy
     if str(OWNER_ID) not in g_access: g_access[str(OWNER_ID)] = "pusy"
-    if str(CO_OWNER_ID) not in g_access: g_access[str(CO_OWNER_ID)] = "pusy"
+    if str(TEXADMIN_ID) not in g_access: g_access[str(TEXADMIN_ID)] = "pusy"
 
     acc_sorted = sorted(g_access.items(), key=lambda x: weights.get(x[1], 0), reverse=True)
 
@@ -763,18 +1117,24 @@ async def list_cmd(ctx):
     tb = [f"{get_name(u)} (до {exp})" for u, exp in combined_bans.items()]
     emb.add_field(name=f"Временные баны [{len(tb)}]", value=safe_fmt(tb), inline=False)
 
-    await ctx.send(embed=emb)
+    await send_ctx(ctx, embed=emb, ephemeral=True)
 
-@bot.command()
+@bot.hybrid_command(name="clear", description="Удалить сообщения в текущем канале")
+@app_commands.rename(amount="количество")
+@app_commands.describe(amount="Количество сообщений для удаления")
 async def clear(ctx, amount: int = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 2: return
+    if get_lvl(ctx.guild.id, ctx.author.id) < 2:
+        return await reply_err(ctx, "Недостаточно прав для очистки сообщений.")
     if not amount or amount < 1: return await reply_err(ctx, "Укажите количество сообщений")
     if amount > 1000: amount = 1000
 
     try:
-        deleted = await ctx.channel.purge(limit=amount + 1)
-        msg = await ctx.send(f"> **( + )** Удалено **{len(deleted)-1}** сообщений.")
-        await send_log(ctx.guild, "Очистка чата", f"{ctx.author.mention} удалил {len(deleted)-1} сообщений в {ctx.channel.mention}.")
+        is_slash = supports_ephemeral(ctx)
+        purge_limit = amount if is_slash else amount + 1
+        deleted = await ctx.channel.purge(limit=purge_limit)
+        deleted_count = len(deleted) if is_slash else max(len(deleted) - 1, 0)
+        msg = await reply_ok(ctx, f"Удалено сообщений: **{deleted_count}**")
+        await send_log(ctx.guild, "Очистка чата", f"{ctx.author.mention} удалил {deleted_count} сообщений в {ctx.channel.mention}.")
         await asyncio.sleep(10)
         try: 
             await msg.delete()
@@ -785,71 +1145,110 @@ async def clear(ctx, amount: int = None):
     except Exception as e:
         await reply_err(ctx, f"Ошибка: {e}")
 
-@bot.command()
-async def blacklist(ctx, user: discord.User = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 1: return
+@bot.hybrid_command(name="blacklist", description="Добавить пользователя в черный список")
+@app_commands.rename(user="пользователь")
+@app_commands.describe(user="Пользователь для добавления в черный список")
+async def blacklist(ctx, user: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 1:
+        return await reply_err(ctx, "Недостаточно прав для черного списка.")
     if not user: return await reply_err(ctx, "Укажите пользователя")
-    if user.id in [OWNER_ID, CO_OWNER_ID]: return await reply_err(ctx, "Нельзя добавить создателя")
+    user_id, _ = await resolve_user(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    user_mention = f"<@{user_id}>"
+    if is_trusted_user(user_id): return await reply_err(ctx, "Нельзя добавить создателя")
 
     bl = get_g_list(BLACKLIST_IDS, ctx.guild.id)
-    if user.id not in bl:
-        bl.append(user.id)
+    if user_id not in bl:
+        bl.append(user_id)
+        ok, warning = await apply_blacklist_restrictions(
+            ctx.guild,
+            user_id,
+            reason=f"BlackList: {ctx.author.name}"
+        )
         
-        member = ctx.guild.get_member(user.id)
+        member = ctx.guild.get_member(user_id)
         if member and member.voice:
             try: 
                 await member.move_to(None, reason="Blacklist")
             except: 
                 pass
             
-        await reply_ok(ctx, f"{user.mention} добавлен в черный список")
-        await send_log(ctx.guild, "ЧС", f"{ctx.author.mention} добавил {user.mention} в ЧС.", RED_COLOR)
+        suffix = f" ({warning})" if warning else ""
+        await reply_ok(ctx, f"{user_mention} добавлен в черный список{suffix}")
+        await send_log(ctx.guild, "BlackList", f"{ctx.author.mention} добавил {user_mention} в BlackList.", RED_COLOR)
     else: 
-        await reply_err(ctx, f"{user.mention} уже в черном списке")
+        await reply_err(ctx, f"{user_mention} уже в черном списке")
 
-@bot.command()
-async def unblacklist(ctx, user: discord.User = None):
+@bot.hybrid_command(name="unblacklist", description="Удалить пользователя из черного списка")
+@app_commands.rename(user="пользователь")
+@app_commands.describe(user="Пользователь для удаления из черного списка")
+async def unblacklist(ctx, user: str = None):
     if not user: return await reply_err(ctx, "Укажите пользователя")
-    is_self_unban = (user.id == ctx.author.id)
-    if not is_self_unban and get_lvl(ctx.guild.id, ctx.author.id) < 1: return
+    user_id, _ = await resolve_user(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    user_mention = f"<@{user_id}>"
+    is_self_unban = (user_id == ctx.author.id)
+    if not is_self_unban and get_lvl(ctx.guild.id, ctx.author.id) < 1:
+        return await reply_err(ctx, "Недостаточно прав для черного списка.")
 
     bl = get_g_list(BLACKLIST_IDS, ctx.guild.id)
-    if user.id in bl:
-        bl.remove(user.id)
-        await reply_ok(ctx, f"{user.mention} удален из черного списка")
-        await send_log(ctx.guild, "ЧС", f"{ctx.author.mention} вынес {user.mention} из ЧС.")
+    if user_id in bl:
+        bl.remove(user_id)
+        ok, warning = await restore_blacklist_roles(
+            ctx.guild,
+            user_id,
+            reason=f"BlackList снят: {ctx.author.name}"
+        )
+        suffix = f" ({warning})" if warning else ""
+        await reply_ok(ctx, f"{user_mention} удален из черного списка{suffix}")
+        await send_log(ctx.guild, "BlackList", f"{ctx.author.mention} вынес {user_mention} из BlackList.")
     else: 
         await reply_err(ctx, "Этого пользователя нет в черном списке")
 
-@bot.command(name="прота")
-async def prota_cmd(ctx, user: discord.User = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 2: return
+@bot.hybrid_command(name="прота", description="Добавить пользователя в защищенные")
+@app_commands.rename(user="пользователь")
+@app_commands.describe(user="Пользователь для защиты")
+async def prota_cmd(ctx, user: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 2:
+        return await reply_err(ctx, "Недостаточно прав для защиты пользователей.")
     if not user: return await reply_err(ctx, "Укажите пользователя")
+    user_id, _ = await resolve_user(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    user_mention = f"<@{user_id}>"
 
     prota = get_g_list(PROTECTED_USERS, ctx.guild.id)
-    if user.id not in prota:
-        prota.append(user.id)
-        await reply_ok(ctx, f"{user.mention} теперь прота")
-        await send_log(ctx.guild, "Прота", f"{ctx.author.mention} выдал проту {user.mention}.")
+    if user_id not in prota:
+        prota.append(user_id)
+        await reply_ok(ctx, f"{user_mention} теперь прота")
+        await send_log(ctx.guild, "Прота", f"{ctx.author.mention} выдал проту {user_mention}.")
     else: 
-        await reply_err(ctx, f"{user.mention} уже в проте")
+        await reply_err(ctx, f"{user_mention} уже в проте")
 
-@bot.command(name="анпрота")
-async def unprota_cmd(ctx, user: discord.User = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 2: return
+@bot.hybrid_command(name="анпрота", description="Удалить пользователя из защищенных")
+@app_commands.rename(user="пользователь")
+@app_commands.describe(user="Пользователь для снятия защиты")
+async def unprota_cmd(ctx, user: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 2:
+        return await reply_err(ctx, "Недостаточно прав для снятия защиты.")
     if not user: return await reply_err(ctx, "Укажите пользователя")
+    user_id, _ = await resolve_user(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    user_mention = f"<@{user_id}>"
 
     prota = get_g_list(PROTECTED_USERS, ctx.guild.id)
-    if user.id in prota:
-        prota.remove(user.id)
-        await reply_ok(ctx, f"{user.mention} убран из проты")
-        await send_log(ctx.guild, "Прота", f"{ctx.author.mention} снял проту с {user.mention}.")
+    if user_id in prota:
+        prota.remove(user_id)
+        await reply_ok(ctx, f"{user_mention} убран из проты")
+        await send_log(ctx.guild, "Прота", f"{ctx.author.mention} снял проту с {user_mention}.")
     else: 
-        await reply_err(ctx, f"{user.mention} не в проте")
+        await reply_err(ctx, f"{user_mention} не в проте")
 
-@bot.command()
+@bot.hybrid_command(name="pusy", description="Выдать временный pusy-бан")
+@app_commands.rename(target="цель", duration="длительность", reason="причина")
+@app_commands.describe(target="ID или упоминание пользователя", duration="Срок: 10s, 30m, 2h, 7d", reason="Причина бана")
 async def pusy(ctx, target: str = None, duration: str = None, *, reason: str = "Не указана"):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 2: return
+    if get_lvl(ctx.guild.id, ctx.author.id) < 2:
+        return await reply_err(ctx, "Недостаточно прав для выдачи бана.")
     if not target or not duration:
         return await reply_err(ctx, "Укажите пользователя и время (s, m, h, d).")
 
@@ -858,7 +1257,7 @@ async def pusy(ctx, target: str = None, duration: str = None, *, reason: str = "
     except:
         return await reply_err(ctx, "Неверный ID.")
         
-    if target_id in [OWNER_ID, CO_OWNER_ID]: 
+    if is_trusted_user(target_id):
         return await reply_err(ctx, "Данного пользователя нельзя забанить!")
 
     match = re.match(r"(\d+)([smhd])", duration.lower())
@@ -885,29 +1284,37 @@ async def pusy(ctx, target: str = None, duration: str = None, *, reason: str = "
     await reply_ok(ctx, f"<@{target_id}> забанен до {time_fmt}")
     await send_log(ctx.guild, "Pusy", f"{ctx.author.mention} забанил <@{target_id}>.\nСрок: до {time_fmt}\nПричина: {reason}", RED_COLOR)
 
-@bot.command()
-async def unpusy(ctx, uid: int = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 2: return
+@bot.hybrid_command(name="unpusy", description="Снять pusy-бан")
+@app_commands.rename(uid="айди")
+@app_commands.describe(uid="ID пользователя")
+async def unpusy(ctx, uid: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 2:
+        return await reply_err(ctx, "Недостаточно прав для снятия бана.")
     if not uid: return await reply_err(ctx, "Укажите ID")
+    user_id = parse_user_id(uid)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
 
     a_bans = get_g_dict(A_TEMP_BANS, ctx.guild.id)
-    if str(uid) in a_bans:
+    if str(user_id) in a_bans:
         return await reply_err(ctx, "Нет прав на снятие этого бана.")
 
     g_bans = get_g_dict(TEMP_BANS, ctx.guild.id)
-    if str(uid) in g_bans: 
-        del g_bans[str(uid)]
+    if str(user_id) in g_bans: 
+        del g_bans[str(user_id)]
         
     try: 
-        await ctx.guild.unban(discord.Object(id=uid), reason=f"unpusy. Модератор: {ctx.author.name}")
-        await reply_ok(ctx, f"бан снят с <@{uid}>")
-        await send_log(ctx.guild, "Unpusy", f"{ctx.author.mention} снял pusy бан с <@{uid}>.")
+        await ctx.guild.unban(discord.Object(id=user_id), reason=f"unpusy. Модератор: {ctx.author.name}")
+        await reply_ok(ctx, f"бан снят с <@{user_id}>")
+        await send_log(ctx.guild, "Unpusy", f"{ctx.author.mention} снял pusy бан с <@{user_id}>.")
     except: 
-        await reply_ok(ctx, f"<@{uid}> удален из базы")
+        await reply_ok(ctx, f"<@{user_id}> удален из базы")
 
-@bot.command(name="apusy")
+@bot.hybrid_command(name="apusy", description="Выдать усиленный временный apusy-бан")
+@app_commands.rename(target="цель", duration="длительность", reason="причина")
+@app_commands.describe(target="ID или упоминание пользователя", duration="Срок: 10s, 30m, 2h, 7d", reason="Причина бана")
 async def apusy_cmd(ctx, target: str = None, duration: str = None, *, reason: str = "Не указана"):
-    if ctx.author.id not in [OWNER_ID, CO_OWNER_ID]: return
+    if not is_trusted_user(ctx.author.id):
+        return await reply_err(ctx, "Команда доступна только доверенным пользователям.")
     if not target or not duration:
         return await reply_err(ctx, "Укажите пользователя и время (s, m, h, d).")
 
@@ -916,7 +1323,7 @@ async def apusy_cmd(ctx, target: str = None, duration: str = None, *, reason: st
     except:
         return await reply_err(ctx, "Неверный ID.")
         
-    if target_id in [OWNER_ID, CO_OWNER_ID]: 
+    if is_trusted_user(target_id):
         return await reply_err(ctx, "Данного пользователя нельзя забанить!")
 
     match = re.match(r"(\d+)([smhd])", duration.lower())
@@ -943,81 +1350,63 @@ async def apusy_cmd(ctx, target: str = None, duration: str = None, *, reason: st
     await reply_ok(ctx, f"<@{target_id}> темпбан до {time_fmt}")
     await send_log(ctx.guild, "Apusy", f"{ctx.author.mention} выдал apusy <@{target_id}>.\nСрок: до {time_fmt}\nПричина: {reason}", RED_COLOR)
 
-@bot.command(name="aunpusy")
-async def aunpusy_cmd(ctx, uid: int = None):
-    if ctx.author.id not in [OWNER_ID, CO_OWNER_ID]: return
+@bot.hybrid_command(name="aunpusy", description="Снять apusy-бан")
+@app_commands.rename(uid="айди")
+@app_commands.describe(uid="ID пользователя")
+async def aunpusy_cmd(ctx, uid: str = None):
+    if not is_trusted_user(ctx.author.id):
+        return await reply_err(ctx, "Команда доступна только доверенным пользователям.")
     if not uid: return await reply_err(ctx, "Укажите ID")
+    user_id = parse_user_id(uid)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
 
     a_bans = get_g_dict(A_TEMP_BANS, ctx.guild.id)
-    if str(uid) in a_bans: 
-        del a_bans[str(uid)]
+    if str(user_id) in a_bans: 
+        del a_bans[str(user_id)]
         
     try: 
-        await ctx.guild.unban(discord.Object(id=uid), reason=f"aunpusy. Снял: {ctx.author.name}")
-        await reply_ok(ctx, f"apusy бан снят с <@{uid}>")
-        await send_log(ctx.guild, "Aunpusy", f"{ctx.author.mention} снял apusy бан с <@{uid}>.")
+        await ctx.guild.unban(discord.Object(id=user_id), reason=f"aunpusy. Снял: {ctx.author.name}")
+        await reply_ok(ctx, f"apusy бан снят с <@{user_id}>")
+        await send_log(ctx.guild, "Aunpusy", f"{ctx.author.mention} снял apusy бан с <@{user_id}>.")
     except: 
-        await reply_ok(ctx, f"<@{uid}> удален из базы")
+        await reply_ok(ctx, f"<@{user_id}> удален из базы")
 
-@bot.command()
-async def sbrole(ctx, user: discord.Member = None, r_id: int = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 2: return
+@bot.hybrid_command(name="giverole", description="Выдать роль пользователю")
+@app_commands.rename(user="пользователь", r_id="роль")
+@app_commands.describe(user="Пользователь", r_id="ID роли")
+async def giverole(ctx, user: str = None, r_id: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 3:
+        return await reply_err(ctx, "Недостаточно прав для выдачи ролей.")
     if not user or not r_id: return await reply_err(ctx, "Укажите пользователя и ID роли")
-    
-    role = ctx.guild.get_role(r_id)
-    if not role: return await reply_err(ctx, "Роль не найдена")
+    user_id, member = resolve_member(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    if not member: return await reply_err(ctx, "Пользователь не найден на сервере")
 
-    msg = await reply_info(ctx, "Фиксирую роль...")
-
-    try: 
-        await user.edit(roles=[role], reason=f"Sbrole: {ctx.author.name}")
-    except discord.Forbidden: 
-        return await msg.edit(content="> **( - )** Ошибка прав.")
-    except Exception as e: 
-        return await msg.edit(content=f"> **( - )** Ошибка: {e}")
-
-    s_roles = get_g_dict(STABLE_ROLES, ctx.guild.id)
-    s_roles[str(user.id)] = r_id
-
-    await msg.edit(content=f"> **( + )** Роль **{role.name}** зафиксирована для {user.mention}")
-    await send_log(ctx.guild, "Sbrole", f"{ctx.author.mention} зафиксировал роль **{role.name}** для {user.mention}.")
-
-@bot.command()
-async def unsbrole(ctx, user: discord.User = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 2: return
-    if not user: return await reply_err(ctx, "Укажите пользователя")
-
-    s_roles = get_g_dict(STABLE_ROLES, ctx.guild.id)
-    if str(user.id) in s_roles:
-        del s_roles[str(user.id)]
-        await reply_ok(ctx, f"фиксация снята для {user.mention}")
-        await send_log(ctx.guild, "Unsbrole", f"{ctx.author.mention} снял фиксацию с {user.mention}.")
-    else: 
-        await reply_err(ctx, f"у {user.mention} нет фиксации")
-
-@bot.command()
-async def giverole(ctx, user: discord.Member = None, r_id: int = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 3: return
-    if not user or not r_id: return await reply_err(ctx, "Укажите пользователя и ID роли")
-
-    role = ctx.guild.get_role(r_id)
+    role_id = parse_user_id(r_id)
+    if not role_id: return await reply_err(ctx, "Неверный ID роли.")
+    role = ctx.guild.get_role(role_id)
     if not role: return await reply_err(ctx, "Роль не найдена")
 
     try:
-        await user.add_roles(role, reason=f"giverole: {ctx.author.name}")
-        await reply_ok(ctx, f"роль **{role.name}** выдана {user.mention}")
-        await send_log(ctx.guild, "Giverole", f"{ctx.author.mention} выдал роль **{role.name}** {user.mention}.")
+        await member.add_roles(role, reason=f"giverole: {ctx.author.name}")
+        await reply_ok(ctx, f"роль **{role.name}** выдана {member.mention}")
+        await send_log(ctx.guild, "Giverole", f"{ctx.author.mention} выдал роль **{role.name}** {member.mention}.")
     except discord.Forbidden:
         await reply_err(ctx, "Ошибка прав.")
     except Exception as e:
         await reply_err(ctx, f"Ошибка: {e}")
 
-@bot.command()
-async def giveall(ctx, r_id: int = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 3: return
+@bot.hybrid_command(name="giveall", description="Выдать роль всем участникам")
+@app_commands.rename(r_id="роль")
+@app_commands.describe(r_id="ID роли")
+async def giveall(ctx, r_id: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 3:
+        return await reply_err(ctx, "Недостаточно прав для массовой выдачи ролей.")
     if not r_id: return await reply_err(ctx, "Укажите ID роли")
     
-    role = ctx.guild.get_role(r_id)
+    role_id = parse_user_id(r_id)
+    if not role_id: return await reply_err(ctx, "Неверный ID роли.")
+    role = ctx.guild.get_role(role_id)
     if not role: return await reply_err(ctx, "Роль не найдена")
 
     msg = await reply_info(ctx, f"Выдаю роль **{role.name}**...")
@@ -1033,86 +1422,120 @@ async def giveall(ctx, r_id: int = None):
     await msg.edit(content=f"> **( + )** Роль **{role.name}** выдана всем")
     await send_log(ctx.guild, "Giveall", f"{ctx.author.mention} выдал всем роль **{role.name}**.")
 
-@bot.command()
-async def unrole(ctx, user: discord.Member = None, r_id: int = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 2: return
+@bot.hybrid_command(name="unrole", description="Снять роль с пользователя")
+@app_commands.rename(user="пользователь", r_id="роль")
+@app_commands.describe(user="Пользователь", r_id="ID роли")
+async def unrole(ctx, user: str = None, r_id: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 2:
+        return await reply_err(ctx, "Недостаточно прав для снятия ролей.")
     if not user or not r_id: return await reply_err(ctx, "Укажите пользователя и ID роли")
+    user_id, member = resolve_member(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    if not member: return await reply_err(ctx, "Пользователь не найден на сервере")
     
-    role = ctx.guild.get_role(r_id)
+    role_id = parse_user_id(r_id)
+    if not role_id: return await reply_err(ctx, "Неверный ID роли.")
+    role = ctx.guild.get_role(role_id)
     if not role: return await reply_err(ctx, "Роль не найдена")
     
-    if role in user.roles:
+    if role in member.roles:
         try:
-            await user.remove_roles(role, reason=f"unrole: {ctx.author.name}")
-            await reply_ok(ctx, f"роль {role.name} снята у {user.mention}")
-            await send_log(ctx.guild, "Unrole", f"{ctx.author.mention} снял роль {role.name} у {user.mention}.")
+            await member.remove_roles(role, reason=f"unrole: {ctx.author.name}")
+            await reply_ok(ctx, f"роль {role.name} снята у {member.mention}")
+            await send_log(ctx.guild, "Unrole", f"{ctx.author.mention} снял роль {role.name} у {member.mention}.")
         except: 
             await reply_err(ctx, "Ошибка прав")
 
-@bot.command()
-async def mod(ctx, user: discord.User = None, lvl: str = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 3: return
+@bot.hybrid_command(name="mod", description="Выдать уровень доступа пользователю")
+@app_commands.rename(user="пользователь", lvl="уровень")
+@app_commands.describe(user="Пользователь", lvl="Уровень: low, mid или pusy")
+async def mod(ctx, user: str = None, lvl: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 3:
+        return await reply_err(ctx, "Недостаточно прав для управления доступами.")
     if not user or not lvl: return await reply_err(ctx, "Укажите пользователя и уровень (low/mid/pusy)")
+    user_id, _ = await resolve_user(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    user_mention = f"<@{user_id}>"
 
-    target_lvl = get_lvl(ctx.guild.id, user.id)
-    if target_lvl >= 3 and ctx.author.id not in [OWNER_ID, CO_OWNER_ID]:
+    target_lvl = get_lvl(ctx.guild.id, user_id)
+    if target_lvl >= 3 and not is_trusted_user(ctx.author.id):
         return await reply_err(ctx, "Нельзя менять права pusy")
 
     lvl = lvl.lower()
     if lvl not in ["low", "mid", "pusy"]: 
         return await reply_err(ctx, "Такого уровня нет")
 
-    if ctx.author.id not in [OWNER_ID, CO_OWNER_ID] and lvl != "low": 
+    if not is_trusted_user(ctx.author.id) and lvl != "low":
         return await reply_err(ctx, "Вы можете выдать только 'low'")
 
     g_access = get_g_dict(USER_ACCESS, ctx.guild.id)
-    g_access[str(user.id)] = lvl
-    await reply_ok(ctx, f"{user.mention} выдан доступ **{lvl}**")
-    await send_log(ctx.guild, "Mod", f"{ctx.author.mention} выдал доступ **{lvl}** для {user.mention}.")
+    g_access[str(user_id)] = lvl
+    await reply_ok(ctx, f"{user_mention} выдан доступ **{lvl}**")
+    await send_log(ctx.guild, "Mod", f"{ctx.author.mention} выдал доступ **{lvl}** для {user_mention}.")
 
-@bot.command()
-async def unmod(ctx, user: discord.User = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 3: return
+@bot.hybrid_command(name="unmod", description="Снять уровень доступа с пользователя")
+@app_commands.rename(user="пользователь")
+@app_commands.describe(user="Пользователь")
+async def unmod(ctx, user: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 3:
+        return await reply_err(ctx, "Недостаточно прав для управления доступами.")
     if not user: return await reply_err(ctx, "Укажите пользователя")
+    user_id, _ = await resolve_user(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    user_mention = f"<@{user_id}>"
 
-    target_lvl = get_lvl(ctx.guild.id, user.id)
-    if target_lvl >= 3 and ctx.author.id not in [OWNER_ID, CO_OWNER_ID]:
+    target_lvl = get_lvl(ctx.guild.id, user_id)
+    if target_lvl >= 3 and not is_trusted_user(ctx.author.id):
         return await reply_err(ctx, "Нельзя снять доступ у pusy")
 
     g_access = get_g_dict(USER_ACCESS, ctx.guild.id)
-    if str(user.id) in g_access:
-        del g_access[str(user.id)]
-        await reply_ok(ctx, f"доступ аннулирован для {user.mention}")
-        await send_log(ctx.guild, "Unmod", f"{ctx.author.mention} снял доступ у {user.mention}.")
+    if str(user_id) in g_access:
+        del g_access[str(user_id)]
+        await reply_ok(ctx, f"доступ аннулирован для {user_mention}")
+        await send_log(ctx.guild, "Unmod", f"{ctx.author.mention} снял доступ у {user_mention}.")
     else:
         await reply_err(ctx, "У пользователя нет доступа")
 
-@bot.command()
-async def wl_add(ctx, user: discord.User = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 3: return
+@bot.hybrid_command(name="wl_add", description="Добавить пользователя в whitelist")
+@app_commands.rename(user="пользователь")
+@app_commands.describe(user="Пользователь")
+async def wl_add(ctx, user: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 3:
+        return await reply_err(ctx, "Недостаточно прав для whitelist.")
     if not user: return await reply_err(ctx, "Укажите пользователя")
+    user_id, _ = await resolve_user(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    user_mention = f"<@{user_id}>"
 
     wl = get_g_list(WHITELIST_IDS, ctx.guild.id)
-    if int(user.id) not in wl:
-        wl.append(int(user.id))
-        await reply_ok(ctx, f"{user.mention} добавлен в вайтлист")
-        await send_log(ctx.guild, "Вайтлист", f"{ctx.author.mention} добавил {user.mention} в вайтлист.")
+    if user_id not in wl:
+        wl.append(user_id)
+        await reply_ok(ctx, f"{user_mention} добавлен в вайтлист")
+        await send_log(ctx.guild, "Вайтлист", f"{ctx.author.mention} добавил {user_mention} в вайтлист.")
 
-@bot.command()
-async def wl_remove(ctx, user: discord.User = None):
-    if get_lvl(ctx.guild.id, ctx.author.id) < 3: return
+@bot.hybrid_command(name="wl_remove", description="Удалить пользователя из whitelist")
+@app_commands.rename(user="пользователь")
+@app_commands.describe(user="Пользователь")
+async def wl_remove(ctx, user: str = None):
+    if get_lvl(ctx.guild.id, ctx.author.id) < 3:
+        return await reply_err(ctx, "Недостаточно прав для whitelist.")
     if not user: return await reply_err(ctx, "Укажите пользователя")
+    user_id, _ = await resolve_user(ctx, user)
+    if not user_id: return await reply_err(ctx, "Неверный ID.")
+    user_mention = f"<@{user_id}>"
 
     wl = get_g_list(WHITELIST_IDS, ctx.guild.id)
-    if int(user.id) in wl:
-        wl.remove(int(user.id))
-        await reply_ok(ctx, f"{user.mention} удален из вайтлиста")
-        await send_log(ctx.guild, "Вайтлист", f"{ctx.author.mention} удалил {user.mention} из вайтлиста.")
+    if user_id in wl:
+        wl.remove(user_id)
+        await reply_ok(ctx, f"{user_mention} удален из вайтлиста")
+        await send_log(ctx.guild, "Вайтлист", f"{ctx.author.mention} удалил {user_mention} из вайтлиста.")
 
-@bot.command()
+@bot.command(name="say")
 async def say(ctx, *, text: str = None):
-    if ctx.author.id not in [OWNER_ID, CO_OWNER_ID]: return
-    if not text: return
+    if not is_trusted_user(ctx.author.id):
+        return await reply_err(ctx, "Команда доступна только доверенным пользователям.")
+    if not text:
+        return await reply_err(ctx, "Укажите текст сообщения.")
     try: 
         await ctx.message.delete()
     except: 
@@ -1134,9 +1557,12 @@ def get_overwrites(obj):
             }
     return ovrs
 
-@bot.command()
+@bot.hybrid_command(name="save_server", description="Сохранить бэкап структуры сервера")
+@app_commands.rename(name="название")
+@app_commands.describe(name="Название бэкапа")
 async def save_server(ctx, name: str = "default"):
-    if ctx.author.id not in [OWNER_ID, CO_OWNER_ID]: return
+    if not is_trusted_user(ctx.author.id):
+        return await reply_err(ctx, "Команда доступна только доверенным пользователям.")
 
     msg = await reply_info(ctx, f"Создаю бэкап **{name}**...")
 
@@ -1196,10 +1622,11 @@ async def save_server(ctx, name: str = "default"):
     else:
         await msg.edit(content=f"> **( - )** Ошибка сохранения бэкапа **{name}**")
 
-@bot.command()
+@bot.hybrid_command(name="list_backups", description="Показать сохраненные бэкапы")
 async def list_backups(ctx):
     """Показать список всех бэкапов"""
-    if ctx.author.id not in [OWNER_ID, CO_OWNER_ID]: return
+    if not is_trusted_user(ctx.author.id):
+        return await reply_err(ctx, "Команда доступна только доверенным пользователям.")
     
     import glob
     backups = glob.glob("backup_*.json")
@@ -1211,12 +1638,15 @@ async def list_backups(ctx):
     backup_list = "\n".join([f"• {name}" for name in backup_names])
     
     emb = discord.Embed(title="📦 Список бэкапов", description=backup_list, color=UI_COLOR)
-    emb.set_footer(text=f"Всего: {len(backups)} | Использование: .load_server <название>")
-    await ctx.send(embed=emb)
+    emb.set_footer(text=f"Всего: {len(backups)} | Использование: /load_server <название>")
+    await send_ctx(ctx, embed=emb, ephemeral=True)
 
-@bot.command()
+@bot.hybrid_command(name="load_server", description="Восстановить сервер из бэкапа")
+@app_commands.rename(name="название")
+@app_commands.describe(name="Название бэкапа")
 async def load_server(ctx, name: str = "default"):
-    if ctx.author.id not in [OWNER_ID, CO_OWNER_ID]: return
+    if not is_trusted_user(ctx.author.id):
+        return await reply_err(ctx, "Команда доступна только доверенным пользователям.")
 
     backup = load_data(f"backup_{name}.json", None)
     if not backup: return await reply_err(ctx, f"Бэкап '{name}' не найден")
@@ -1344,8 +1774,16 @@ async def load_server(ctx, name: str = "default"):
 
 @bot.event
 async def on_ready():
+    global COMMANDS_SYNCED
     if not check_unbans.is_running(): 
         check_unbans.start()
+    if not COMMANDS_SYNCED:
+        try:
+            removed_global, synced_guilds = await sync_application_commands()
+            COMMANDS_SYNCED = True
+            print(f"Синхронизировано slash-команд: removed_global={removed_global}, guild={synced_guilds}")
+        except Exception as e:
+            print(f"Ошибка синхронизации slash-команд: {e}")
     print(f"Бот запущен как {bot.user}")
     print(f"📊 Подключен к {len(bot.guilds)} серверам")
 
@@ -1353,8 +1791,8 @@ async def on_ready():
 # --- FLASK ВЕБ-СЕРВЕР ---
 # ==========================================
 app = Flask(__name__)
-app.secret_key = "lena-syn-imya-ebyrya-materi"
-ADMIN_PASSWORD = "luxygluzz228"
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or os.urandom(32)
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "luxygluzz228")
 
 def login_required(f):
     @wraps(f)
@@ -1383,6 +1821,43 @@ def login():
 def logout():
     session.pop('logged_in', None)
     return redirect(url_for('login'))
+
+def parse_log_date(date_value, *, end_of_day=False):
+    if not date_value:
+        return None
+    try:
+        parsed = datetime.datetime.strptime(date_value, "%Y-%m-%d")
+        if end_of_day:
+            parsed += datetime.timedelta(days=1)
+        return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+def get_log_request_filters():
+    return {
+        "search": (request.args.get("search") or "").strip() or None,
+        "category": (request.args.get("category") or "").strip() or None,
+        "level": (request.args.get("level") or "").strip() or None,
+        "source": (request.args.get("source") or "").strip() or None,
+        "sort": (request.args.get("sort") or "desc").strip().lower(),
+        "limit": request.args.get("limit", 200),
+        "date_from": parse_log_date(request.args.get("date_from")),
+        "date_to": parse_log_date(request.args.get("date_to"), end_of_day=True)
+    }
+
+def format_panel_log_entry(entry):
+    created_at = entry.get("created_at")
+    created_at_display = created_at
+    try:
+        dt = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+        created_at_display = dt.strftime("%d.%m.%Y %H:%M:%S")
+    except Exception:
+        pass
+
+    return {
+        **entry,
+        "created_at_display": created_at_display
+    }
 
 @app.route('/api/guilds')
 @login_required
@@ -1575,6 +2050,43 @@ def api_bans(guild_id):
     
     return jsonify(result)
 
+@app.route('/api/logs/<guild_id>')
+@login_required
+def api_logs(guild_id):
+    try:
+        filters = get_log_request_filters()
+        logs = get_panel_logs(
+            guild_id,
+            search=filters["search"],
+            category=filters["category"],
+            level=filters["level"],
+            source=filters["source"],
+            date_from=filters["date_from"],
+            date_to=filters["date_to"],
+            sort=filters["sort"],
+            limit=filters["limit"]
+        )
+        summary = get_panel_log_summary(
+            guild_id,
+            search=filters["search"],
+            category=filters["category"],
+            level=filters["level"],
+            source=filters["source"],
+            date_from=filters["date_from"],
+            date_to=filters["date_to"]
+        )
+        if summary.get("last_entry"):
+            summary["last_entry"] = format_panel_log_entry(summary["last_entry"])
+        filter_values = get_panel_log_filters(guild_id)
+
+        return jsonify({
+            "logs": [format_panel_log_entry(entry) for entry in logs],
+            "summary": summary,
+            "filters": filter_values
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/members/<guild_id>')
 @login_required
 def api_members(guild_id):
@@ -1603,7 +2115,7 @@ def api_members(guild_id):
             else:
                 avatar_url = member.avatar.url
         
-        # Получаем роли с цветами (топ 5)
+        # Получаем роли с цветами
         roles = []
         for r in sorted(member.roles, key=lambda x: x.position, reverse=True):
             if not r.is_default():
@@ -1612,8 +2124,6 @@ def api_members(guild_id):
                     'name': r.name,
                     'color': f'#{r.color.value:06x}' if r.color.value != 0 else '#99aab5'
                 })
-                if len(roles) >= 5:
-                    break
         
         # Проверяем статусы
         access_level = guild_access.get(str(member.id), None)
@@ -1651,6 +2161,7 @@ def api_action():
     action = data.get('action')
     guild_id = int(data.get('guild_id'))
     user_id = data.get('user_id')
+    user_ref = f"<@{user_id}>" if user_id else "неизвестный пользователь"
     
     guild = bot.get_guild(guild_id)
     if not guild:
@@ -1661,49 +2172,105 @@ def api_action():
             level = data.get('level')
             g_access = get_g_dict(USER_ACCESS, guild_id)
             g_access[str(user_id)] = level
+            save_web_log(guild_id, "Panel Access", f"Web panel выдал доступ **{level}** пользователю {user_ref}.", level="info", category="access")
             return jsonify({'success': True, 'message': f'Доступ {level} выдан'})
         
         elif action == 'remove_access':
             g_access = get_g_dict(USER_ACCESS, guild_id)
             if str(user_id) in g_access:
                 del g_access[str(user_id)]
+                save_web_log(guild_id, "Panel Access", f"Web panel снял доступ у {user_ref}.", level="success", category="access")
             return jsonify({'success': True, 'message': 'Доступ удален'})
         
         elif action == 'add_whitelist':
             wl = get_g_list(WHITELIST_IDS, guild_id)
             if int(user_id) not in wl:
                 wl.append(int(user_id))
+                save_web_log(guild_id, "Panel Whitelist", f"Web panel добавил {user_ref} в WhiteList.", level="info", category="access")
             return jsonify({'success': True, 'message': 'Добавлен в вайтлист'})
         
         elif action == 'remove_whitelist':
             wl = get_g_list(WHITELIST_IDS, guild_id)
             if int(user_id) in wl:
                 wl.remove(int(user_id))
+                save_web_log(guild_id, "Panel Whitelist", f"Web panel удалил {user_ref} из WhiteList.", level="success", category="access")
             return jsonify({'success': True, 'message': 'Удален из вайтлиста'})
         
         elif action == 'add_blacklist':
             bl = get_g_list(BLACKLIST_IDS, guild_id)
+            warning = None
             if int(user_id) not in bl:
                 bl.append(int(user_id))
-            return jsonify({'success': True, 'message': 'Добавлен в ЧС'})
+                future = asyncio.run_coroutine_threadsafe(
+                    apply_blacklist_restrictions(guild, user_id, reason="Веб-панель: BlackList"),
+                    bot.loop
+                )
+                _, warning = future.result(timeout=10)
+                save_web_log(guild_id, "Panel BlackList", f"Web panel добавил {user_ref} в BlackList.", level="danger", category="blacklist")
+            message = 'Добавлен в BlackList'
+            if warning:
+                message += f' ({warning})'
+            return jsonify({'success': True, 'message': message})
         
         elif action == 'remove_blacklist':
             bl = get_g_list(BLACKLIST_IDS, guild_id)
+            warning = None
             if int(user_id) in bl:
                 bl.remove(int(user_id))
-            return jsonify({'success': True, 'message': 'Удален из ЧС'})
+                future = asyncio.run_coroutine_threadsafe(
+                    restore_blacklist_roles(guild, user_id, reason="Веб-панель: снятие BlackList"),
+                    bot.loop
+                )
+                _, warning = future.result(timeout=10)
+                save_web_log(guild_id, "Panel BlackList", f"Web panel удалил {user_ref} из BlackList.", level="success", category="blacklist")
+            message = 'Удален из BlackList'
+            if warning:
+                message += f' ({warning})'
+            return jsonify({'success': True, 'message': message})
         
         elif action == 'add_protected':
             prot = get_g_list(PROTECTED_USERS, guild_id)
             if int(user_id) not in prot:
                 prot.append(int(user_id))
+                save_web_log(guild_id, "Panel Protection", f"Web panel выдал защиту пользователю {user_ref}.", level="info", category="protection")
             return jsonify({'success': True, 'message': 'Добавлен в проту'})
         
         elif action == 'remove_protected':
             prot = get_g_list(PROTECTED_USERS, guild_id)
             if int(user_id) in prot:
                 prot.remove(int(user_id))
+                save_web_log(guild_id, "Panel Protection", f"Web panel снял защиту с {user_ref}.", level="success", category="protection")
             return jsonify({'success': True, 'message': 'Удален из проты'})
+
+        elif action in ('give_role', 'remove_role'):
+            role_id = data.get('role_id')
+            if not role_id:
+                return jsonify({'success': False, 'error': 'Роль не указана'})
+            member = guild.get_member(int(user_id))
+            role = guild.get_role(int(role_id))
+            if not member:
+                return jsonify({'success': False, 'error': 'Пользователь не найден на сервере'})
+            if not role:
+                return jsonify({'success': False, 'error': 'Роль не найдена'})
+            if role >= guild.me.top_role:
+                return jsonify({'success': False, 'error': 'Эта роль выше роли бота'})
+
+            if action == 'give_role':
+                future = asyncio.run_coroutine_threadsafe(
+                    member.add_roles(role, reason="Веб-панель: выдача роли"),
+                    bot.loop
+                )
+                future.result(timeout=10)
+                save_web_log(guild_id, "Panel Roles", f"Web panel выдал роль **{role.name}** пользователю {member.mention}.", level="info", category="roles")
+                return jsonify({'success': True, 'message': f'Роль {role.name} выдана'})
+
+            future = asyncio.run_coroutine_threadsafe(
+                member.remove_roles(role, reason="Веб-панель: снятие роли"),
+                bot.loop
+            )
+            future.result(timeout=10)
+            save_web_log(guild_id, "Panel Roles", f"Web panel снял роль **{role.name}** у {member.mention}.", level="success", category="roles")
+            return jsonify({'success': True, 'message': f'Роль {role.name} снята'})
         
         elif action == 'ban':
             duration = data.get('duration', '1d')
@@ -1732,6 +2299,14 @@ def api_action():
             else:
                 g_bans = get_g_dict(TEMP_BANS, guild_id)
                 g_bans[str(user_id)] = end_str
+
+            save_web_log(
+                guild_id,
+                "Panel Ban",
+                f"Web panel выдал {ban_type} бан пользователю {user_ref} до {end_str}.",
+                level="danger",
+                category="moderation"
+            )
             
             return jsonify({'success': True, 'message': f'Бан выдан до {end_str}'})
         
@@ -1748,6 +2323,7 @@ def api_action():
                 guild.unban(discord.Object(id=int(user_id)), reason="Веб-панель: разбан"),
                 bot.loop
             )
+            save_web_log(guild_id, "Panel Unban", f"Web panel снял бан с пользователя {user_ref}.", level="success", category="moderation")
             return jsonify({'success': True, 'message': 'Бан снят'})
         
         else:
@@ -1767,6 +2343,7 @@ def api_get_autorole(guild_id):
         result = {
             'enabled': auto_roles.get('enabled', False),
             'role_id': auto_roles.get('role_id', None),
+            'role_ids': auto_roles.get('role_ids', []),
             'role_name': None
         }
         
@@ -1786,29 +2363,96 @@ def api_set_autorole(guild_id):
     try:
         data = request.json
         enabled = data.get('enabled', False)
-        role_id = data.get('role_id', None)
+        role_ids = data.get('role_ids', [])
+        if not role_ids and data.get('role_id'):
+            role_ids = [data.get('role_id')]
+        role_ids = [str(role_id) for role_id in role_ids if role_id]
         
         auto_roles = get_g_dict(AUTO_ROLES, int(guild_id))
         auto_roles['enabled'] = enabled
-        
-        if role_id:
-            auto_roles['role_id'] = str(role_id)
-        elif not enabled:
-            auto_roles['role_id'] = None
-        
+        auto_roles['role_ids'] = role_ids
+        auto_roles['role_id'] = role_ids[0] if role_ids else None
+        AUTO_ROLES[int(guild_id)] = auto_roles
+        mode_text = "включил" if enabled else "выключил"
+        roles_text = ", ".join(f"<@&{role_id}>" for role_id in role_ids) if role_ids else "без ролей"
+        save_web_log(
+            guild_id,
+            "Panel Autorole",
+            f"Web panel {mode_text} автороль. Роли: {roles_text}.",
+            level="info" if enabled else "success",
+            category="roles"
+        )
         
         return jsonify({'success': True, 'message': 'Настройки автороли обновлены'})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+def get_panel_url(port):
+    public_url = os.getenv("PUBLIC_PANEL_URL")
+    if public_url:
+        return public_url.rstrip("/")
+
+    railway_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN")
+    if railway_domain:
+        return f"https://{railway_domain}"
+
+    return f"http://127.0.0.1:{port}"
+
 def run_flask():
     port = int(os.getenv("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    try:
+        print(f"Web panel listening on {get_panel_url(port)}")
+        app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    except Exception as e:
+        print(f"Web panel crashed: {e}")
+        os._exit(1)
+
+def start_public_tunnel():
+    provider = os.getenv("PUBLIC_TUNNEL_PROVIDER", "").strip().lower()
+    if not provider:
+        return None
+
+    port = int(os.getenv("PORT", 5000))
+
+    if provider == "pagekite":
+        kite_name = os.getenv("PAGEKITE_KITE", "").strip()
+        if not kite_name:
+            print("PAGEKITE_KITE не задан. Укажите, например, yourname.pagekite.me")
+            return None
+
+        pagekite_bin = os.getenv("PAGEKITE_BIN", "pagekite.py")
+        cmd = [pagekite_bin, str(port), kite_name]
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+        except FileNotFoundError:
+            print("pagekite.py не найден. Установите PageKite и добавьте его в PATH.")
+            return None
+        except Exception as e:
+            print(f"Не удалось запустить PageKite: {e}")
+            return None
+
+        def read_tunnel_output():
+            for line in proc.stdout:
+                line = line.strip()
+                if line:
+                    print(f"pagekite: {line}")
+
+        threading.Thread(target=read_tunnel_output, daemon=True).start()
+        return proc
+
+    print(f"Неизвестный PUBLIC_TUNNEL_PROVIDER: {provider}")
+    return None
 
 # Запуск Flask в отдельном потоке
 flask_thread = threading.Thread(target=run_flask, daemon=True)
 flask_thread.start()
-print("🌐 Веб-сервер запущен на http://0.0.0.0:5000")
+public_tunnel_process = start_public_tunnel()
 
 
 # ==========================================
